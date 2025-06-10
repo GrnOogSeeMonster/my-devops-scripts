@@ -10,10 +10,15 @@ import zipfile
 from datetime import datetime
 
 # Default container names (adjust if yours differ)
-PG_CONTAINER   = "redash_postgres_1"
+PG_CONTAINER    = "redash_postgres_1"
 REDIS_CONTAINER = "redash_redis_1"
 COMPOSE_FILE    = "/opt/redash/docker-compose.yml"
 ENV_FILE        = "/opt/redash/.env"  # adjust if your env lives elsewhere
+
+# Default directories for init
+BACKUP_DIR      = "/opt/backups"
+LOG_DIR         = "/var/log/redash"
+STATE_FILE      = os.path.expanduser("~/.redash_backup_initialized")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +33,36 @@ def run(cmd, **kwargs):
         logger.error(f"Command failed: {cmd}")
         sys.exit(result.returncode)
     return result
+
+
+def do_init():
+    """
+    Create required directories and record initialization state.
+    """
+    actions = []
+
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            prev = f.read().strip()
+        print(f"⚠️  Initialization already ran on {prev}")
+    else:
+        # Ensure backup and log dirs
+        for d in [BACKUP_DIR, LOG_DIR]:
+            if not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+                actions.append(f"Created directory: {d}")
+            else:
+                actions.append(f"Directory already exists: {d}")
+        timestamp = datetime.utcnow().isoformat()
+        with open(STATE_FILE, "w") as f:
+            f.write(timestamp)
+        actions.append(f"Recorded initialization at {timestamp}")
+
+        print("✅ Initialization complete. Actions:")
+        for a in actions:
+            print(f" - {a}")
+    sys.exit(0)
+
 
 def backup(output_dir):
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -50,20 +85,19 @@ def backup(output_dir):
     run(f"docker cp {REDIS_CONTAINER}:/data/dump.rdb {redis_dump}")
 
     # 3) Compose & env
-    if os.path.isfile(COMPOSE_FILE):
-        shutil.copy(COMPOSE_FILE, workdir)
-    else:
-        logger.warning(f"{COMPOSE_FILE} not found, skipping")
-    if os.path.isfile(ENV_FILE):
-        shutil.copy(ENV_FILE, workdir)
+    for fn in [COMPOSE_FILE, ENV_FILE]:
+        if os.path.isfile(fn):
+            shutil.copy(fn, workdir)
+        else:
+            logger.warning(f"{fn} not found, skipping")
 
     # 4) Zip it up
     archive = os.path.join(output_dir, f"redash-backup-{timestamp}.zip")
     logger.info(f"Creating archive {archive}")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, _, files in os.walk(workdir):
-            for fn in files:
-                full = os.path.join(root, fn)
+            for file in files:
+                full = os.path.join(root, file)
                 arcname = os.path.relpath(full, workdir)
                 zf.write(full, arcname)
 
@@ -72,6 +106,7 @@ def backup(output_dir):
     logger.info("Backup complete.")
     return archive
 
+
 def restore(archive, project_dir):
     temp = tempfile.mkdtemp(prefix="redash-restore-")
     logger.info(f"Extracting {archive} to {temp}")
@@ -79,11 +114,10 @@ def restore(archive, project_dir):
         zf.extractall(temp)
 
     os.chdir(project_dir)
-    # 1) Stop stack
     logger.info("Stopping existing Redash stack")
     run("docker-compose down")
 
-    # 2) Restore Postgres
+    # Restore Postgres
     sqls = [f for f in os.listdir(temp) if f.endswith(".sql")]
     if not sqls:
         logger.error("No .sql dump found in archive")
@@ -100,7 +134,7 @@ def restore(archive, project_dir):
             logger.error("Postgres restore failed")
             sys.exit(proc.returncode)
 
-    # 3) Restore Redis
+    # Restore Redis
     redis_backup = os.path.join(temp, "redis-dump.rdb")
     if os.path.isfile(redis_backup):
         logger.info("Copying Redis dump back into container")
@@ -108,53 +142,59 @@ def restore(archive, project_dir):
     else:
         logger.warning("No redis-dump.rdb found, skipping")
 
-    # 4) Restore compose/env (optional—only if you want to overwrite)
-    if os.path.isfile(os.path.join(temp, os.path.basename(COMPOSE_FILE))):
-        shutil.copy(
-            os.path.join(temp, os.path.basename(COMPOSE_FILE)),
-            COMPOSE_FILE
-        )
-    if os.path.isfile(os.path.join(temp, os.path.basename(ENV_FILE))):
-        shutil.copy(
-            os.path.join(temp, os.path.basename(ENV_FILE)),
-            ENV_FILE
-        )
+    # Optionally restore compose/env
+    for fn in [COMPOSE_FILE, ENV_FILE]:
+        base = os.path.basename(fn)
+        src = os.path.join(temp, base)
+        if os.path.isfile(src):
+            shutil.copy(src, fn)
 
-    # 5) Start stack
     logger.info("Bringing Redash back up")
     run("docker-compose up -d")
-
     shutil.rmtree(temp)
     logger.info("Restore complete.")
 
+
 def main():
-    p = argparse.ArgumentParser(
-        description="Redash full backup & restore"
+    parser = argparse.ArgumentParser(
+        description="Redash full backup, restore, and initialization"
     )
-    grp = p.add_mutually_exclusive_group(required=True)
-    grp.add_argument(
-        "--backup",
-        metavar="OUTDIR",
+    parser.add_argument(
+        "--init", action="store_true",
+        help="Initialize directories and record state"
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--backup", metavar="OUTDIR",
         help="Perform a backup to OUTDIR"
     )
-    grp.add_argument(
-        "--restore",
-        metavar="ARCHIVE",
+    group.add_argument(
+        "--restore", metavar="ARCHIVE",
         help="Restore from ARCHIVE zip file"
     )
-    p.add_argument(
-        "--project-dir",
-        default=os.getcwd(),
+    parser.add_argument(
+        "--project-dir", default=os.getcwd(),
         help="Directory containing your docker-compose.yml"
     )
-    args = p.parse_args()
 
-    if args.backup:
+    # Show help if no arguments provided
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+
+    args = parser.parse_args()
+
+    if args.init:
+        do_init()
+    elif args.backup:
         archive = backup(args.backup)
         print(f"✅ Backup written to: {archive}")
     elif args.restore:
         restore(args.restore, args.project_dir)
         print("✅ Restore finished.")
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
