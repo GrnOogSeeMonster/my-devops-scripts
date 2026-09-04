@@ -1,22 +1,95 @@
-# Redash Backup & Restore Utility
+# my-devops-scripts
 
-This script provides three primary functions for your Docker-based Redash instance:
+Operational tooling for self-hosted [Redash](https://redash.io/): a single Python script
+that backs up, restores, diagnoses and version-upgrades a Docker Compose Redash stack.
 
-1. **Initialization** (`--init`)  
-   Ensure required directories exist and record that initialization has run.
-2. **Backup** (`--backup <OUTDIR>`)  
-   Export PostgreSQL, Redis, Docker Compose, and environment files into a timestamped ZIP.
-3. **Restore** (`--restore <ZIP> --project-dir <DIR>`)  
-   Unzip, load data back into containers, and bring your stack back up.
+---
+
+## Status
+
+**In use and considerably larger than this README once described.** Last worked on
+25 June 2025.
+
+| | |
+|---|---|
+| Size | `redash_backup.py` is 2,715 lines / 36 functions; `backup_redash.sh` is a 90-line shell wrapper |
+| Scope | Backup and restore, plus database validation, user management, secret-key repair, version upgrade and a set of restore-diagnosis commands |
+| Tests | None. It is verified by use against a real instance |
+| Blast radius | `--restore` and `--force-clean` stop the stack and destroy volumes. Read the flag before you type it |
+
+The script grew out of a real restore that went wrong: most of what is beyond `--backup`
+and `--restore` exists because a restore silently produced an empty dashboard list and
+the cause turned out to be a `REDASH_SECRET_KEY` mismatch between the backup and the
+target host. `--analyze-backup`, `--diagnose`, `--debug-data` and `--fix-secret-key` are the tools
+built to find that class of problem quickly.
+
+It detects both the legacy (`redash_postgres_1`) and modern (`redash-postgres-1`)
+container naming, and both `docker-compose` and `docker compose`, so it works across
+Redash installs of different vintages.
+
+---
+
+## Commands
+
+**Setup**
+
+| Flag | |
+|---|---|
+| `--init` | Create `/opt/backups` and `/var/log/redash`, record initialisation state |
+
+**Backup and restore**
+
+| Flag | |
+|---|---|
+| `--backup <OUTDIR>` | Postgres dump + Redis `dump.rdb` + `docker-compose.yml` + `.env` into a timestamped ZIP |
+| `--restore <ARCHIVE>` | Stop the stack, load Postgres and Redis, restore configs, bring it back up |
+| `--enhanced-restore <ARCHIVE>` | Restore with extra validation and recovery steps |
+| `--force-clean` | **Destructive.** Wipe volumes before restoring |
+
+**Safety and validation**
+
+| Flag | |
+|---|---|
+| `--validate-db` | Check the database is present and populated |
+| `--diagnose` | Diagnose a restore that appears to have produced no data |
+
+**User management**
+
+| Flag | |
+|---|---|
+| `--list-users` | List Redash users |
+| `--reset-password <EMAIL> [PASSWORD]` | Reset a user's password |
+
+**Debug and troubleshooting**
+
+| Flag | |
+|---|---|
+| `--analyze-backup <ARCHIVE>` | Inspect an archive's contents without restoring |
+| `--test-restore <ARCHIVE>` | Dry-run a restore step by step |
+| `--manual-restore-test <ARCHIVE>` | Walk a restore manually for debugging |
+| `--debug-data` | Trace missing data after a restore |
+| `--fix-secret-key <KEY>` | Repair a `REDASH_SECRET_KEY` mismatch between backup and host |
+
+**Version management**
+
+| Flag | |
+|---|---|
+| `--upgrade-10`, `--upgrade-25` | Semantic upgrade to Redash 10 / 25 |
+| `--setup-10`, `--setup-25`, `--setup-version <V>` | Fresh install at a given version |
+| `--dry-run` | Preview an upgrade or setup without executing |
+
+**Global**
+
+| Flag | |
+|---|---|
+| `--project-dir <DIR>` | Directory holding `docker-compose.yml` (default `/opt/redash`) |
 
 ---
 
 ## Prerequisites
 
-- Ubuntu 18.04+ (Bionic or later)
-- Python 3.x
-- Docker & Docker Compose installed
-- Your Redash stack lives under `/opt/redash` (adjust `COMPOSE_FILE` & `ENV_FILE` in the script if needed)
+Ubuntu 18.04+, Python 3, Docker and Docker Compose, and a Redash stack under
+`/opt/redash` (or pass `--project-dir`).
 
 ---
 
@@ -72,18 +145,6 @@ Restore from a backup archive:
 - Loads data into Postgres & Redis
 - Restores Compose/Env files if present
 - Brings the stack back up in detached mode
-
----
-
-## Command-line Options
-
-| Flag                  | Description                                                   |
-| --------------------- | ------------------------------------------------------------- |
-| `--init`              | Initialize directories & record state                         |
-| `--backup <OUTDIR>`   | Backup into specified directory                               |
-| `--restore <ARCHIVE>` | Restore from given ZIP archive                                |
-| `--project-dir <DIR>` | Directory containing your `docker-compose.yml` (default: cwd) |
-| `-h`, `--help`        | Show usage information                                        |
 
 ---
 
